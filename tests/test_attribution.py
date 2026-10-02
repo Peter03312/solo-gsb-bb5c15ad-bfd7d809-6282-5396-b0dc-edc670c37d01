@@ -11,7 +11,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.attribution import (  # noqa: E402
     EventView,
+    RulingView,
     attribute,
+    attribute_with_rulings,
     merge,
     subtract,
     total_minutes,
@@ -173,6 +175,105 @@ def test_used_versions_reflect_contribution():
     by_source = {u["source_id"]: u["version"] for u in used}
     assert by_source == {"M1": 3, "F2": 1}
 
+
+# ---------------------------------------------------------------- 现场人工裁定
+
+
+def rv(no: str, reason: str, start: datetime, end: datetime, seq: int) -> RulingView:
+    return RulingView(ruling_no=no, reason=reason, start=start, end=end, seq=seq)
+
+
+def test_ruling_overrides_all_event_priorities():
+    # 保养 [10,12) 事件；裁定 [10:30,11:30) 为故障：裁定分钟覆盖保养
+    totals, used = attribute_with_rulings(
+        h(8),
+        h(16),
+        [ev("M1", 1, "maintenance", h(10), h(12))],
+        [rv("R1", "failure", h(10, 30), h(11, 30), 1)],
+    )
+    assert totals == {"maintenance": 60, "failure": 60, "pending": 0}
+    assert [u["source_id"] for u in used] == ["M1"]
+
+
+def test_ruling_split_window_event_priority_kept_in_free_parts():
+    # 故障事件 [9,13)；保养事件 [10,12)；裁定 [10:30,11:30) pending
+    # 裁定外的剩余窗口中保养仍优先于故障：
+    # [9,10:30) -> 保养 30(10-10:30) + 故障 60(9-10)
+    # 裁定 [10:30,11:30) -> pending 60
+    # [11:30,13) -> 保养 30(11:30-12) + 故障 60(12-13)
+    totals, used = attribute_with_rulings(
+        h(8),
+        h(16),
+        [
+            ev("F1", 1, "failure", h(9), h(13)),
+            ev("M1", 1, "maintenance", h(10), h(12)),
+        ],
+        [rv("R1", "pending", h(10, 30), h(11, 30), 1)],
+    )
+    assert totals == {"maintenance": 60, "failure": 120, "pending": 60}
+    assert {u["source_id"] for u in used} == {"F1", "M1"}
+
+
+def test_overlapping_rulings_latest_seq_wins():
+    # 两条裁定重叠 [11,12)：seq 更大者生效，原因优先级不参与裁定间覆盖
+    totals, used = attribute_with_rulings(
+        h(8),
+        h(16),
+        [],
+        [
+            rv("R1", "maintenance", h(10), h(12), 1),
+            rv("R2", "pending", h(11), h(13), 2),
+        ],
+    )
+    assert totals == {"maintenance": 60, "failure": 0, "pending": 120}
+    assert used == []
+
+
+def test_no_rulings_equals_plain_attribute():
+    events = [
+        ev("M1", 1, "maintenance", h(10), h(11)),
+        ev("F1", 1, "failure", h(10, 30), h(12)),
+    ]
+    t1, u1 = attribute(h(8), h(16), events)
+    t2, u2 = attribute_with_rulings(h(8), h(16), events, [])
+    assert t1 == t2 == {"maintenance": 60, "failure": 60, "pending": 0}
+    assert u1 == u2
+
+
+def test_rulings_clipped_to_shift_window():
+    totals, _ = attribute_with_rulings(
+        h(8),
+        h(16),
+        [],
+        [rv("R1", "failure", h(7), h(8, 30), 1)],
+    )
+    assert totals == {"maintenance": 0, "failure": 30, "pending": 0}
+
+
+def test_event_fully_covered_by_ruling_dropped_from_used():
+    totals, used = attribute_with_rulings(
+        h(8),
+        h(16),
+        [ev("F1", 1, "failure", h(10), h(11))],
+        [rv("R1", "maintenance", h(10), h(11), 1)],
+    )
+    assert totals == {"maintenance": 60, "failure": 0, "pending": 0}
+    assert used == []
+
+
+def test_ruling_then_free_then_ruling_windows():
+    # 裁定 [9,10) 与 [11,12)；故障事件 [9,12) 只在 [10,11) 生效
+    totals, used = attribute_with_rulings(
+        h(8),
+        h(16),
+        [ev("F1", 2, "failure", h(9), h(12))],
+        [
+            rv("R1", "maintenance", h(9), h(10), 1),
+            rv("R2", "maintenance", h(11), h(12), 2),
+        ],
+    )
+    assert totals == {"maintenance": 120, "failure": 60, "pending": 0}
+    assert used == [{"source_id": "F1", "version": 2, "reason": "failure"}]
 
 if __name__ == "__main__":
     tests = [(name, fn) for name, fn in sorted(globals().items()) if name.startswith("test_")]

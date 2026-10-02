@@ -117,7 +117,7 @@ class SettleResponse(BaseModel):
 
 
 class ChangeEntry(BaseModel):
-    """一次结算/更正产生的变更记录（与班次修订同一行存储，内容不可变）。"""
+    """一次结算/更正/裁定产生的变更记录（与班次修订同一行存储，内容不可变）。"""
 
     seq: int  # 全局递增变更序号（提交顺序），作为同步游标
     shift_id: int
@@ -128,7 +128,7 @@ class ChangeEntry(BaseModel):
     totals: ReasonMinutes
     delta: ReasonMinutes  # 本修订相对上一修订的差额
     event_versions: list[EventVersionRef]
-    trigger: str  # settle | correction
+    trigger: str  # settle | correction | adjudication | adjudication_revoke
     created_at: datetime
 
 
@@ -137,3 +137,53 @@ class ChangePage(BaseModel):
 
     changes: list[ChangeEntry]
     next_cursor: int
+
+
+# ---------------------------------------------------------------- 现场人工裁定
+
+
+class AdjudicationIn(_Interval):
+    """已结算班次的现场人工裁定：班次内整分钟半开区间 + 原因 + 说明。"""
+
+    ruling_no: str = Field(
+        min_length=1,
+        max_length=64,
+        description="唯一裁定单号（班次内唯一，建议全局唯一），用于幂等与撤销",
+        examples=["R-20261001-001"],
+    )
+    reason: Reason
+    note: str = Field(default="", max_length=500, description="说明（可选）")
+
+
+class AdjudicationOut(BaseModel):
+    """一条现场人工裁定的当前状态（撤销留痕）。"""
+
+    ruling_no: str
+    start: datetime
+    end: datetime
+    reason: str
+    note: str
+    status: str  # active | revoked
+    created_at: datetime
+    revoked_at: datetime | None = None
+
+
+class RevisionRef(BaseModel):
+    """操作产生的班次修订摘要；未产生修订时该对象为空（response 中为 null）。"""
+
+    revision: int
+    seq: int
+    totals: ReasonMinutes
+    delta: ReasonMinutes
+    trigger: str
+
+
+class AdjudicationAck(BaseModel):
+    """提交/撤销裁定的统一回执：单号、状态、修订号（无修订时明确标示）。"""
+
+    ruling_no: str
+    status: str  # active | revoked
+    idempotent: bool  # True 表示同单号重试/重复撤销，未产生任何修订
+    revision: int | None  # 本次操作产生的修订号；无修订为 null
+    latest_revision: int  # 班次当前最新修订号
+    revision_detail: RevisionRef | None = None  # 本次修订摘要；无修订为 null

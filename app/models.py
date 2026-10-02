@@ -103,7 +103,8 @@ class ChangeCounter(Base):
 class ShiftResult(Base):
     """班次结算结果的一个修订。
 
-    结算后原修订永久保留；迟到更正触发重算时追加新修订并记录与上一修订的差额。
+    结算后原修订永久保留；迟到更正 / 现场人工裁定 / 撤销裁定触发重算时追加新修订
+    并记录与上一修订的差额。
     seq 是全局递增的变更序号（提交顺序），下游按游标同步即读此表 ——
     修订与其变更记录是同一行，天然同事务提交/回滚，且内容不可变。
     """
@@ -126,7 +127,8 @@ class ShiftResult(Base):
     d_pending: Mapped[int] = mapped_column(Integer, nullable=False)
     # 本次计算所依据的事件版本：[{"source_id", "version", "reason"}, ...]
     event_versions: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
-    trigger: Mapped[str] = mapped_column(String(16), nullable=False)  # settle | correction
+    # settle | correction | adjudication | adjudication_revoke
+    trigger: Mapped[str] = mapped_column(String(32), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -134,4 +136,48 @@ class ShiftResult(Base):
     __table_args__ = (
         UniqueConstraint("shift_id", "revision", name="uq_shift_result_revision"),
         UniqueConstraint("seq", name="uq_shift_results_seq"),
+    )
+
+
+class ManualAdjudication(Base):
+    """已结算班次的现场人工裁定。
+
+    - ruling_no 为调用方提供的唯一裁定单号（班次内唯一，建议全局唯一）；
+    - 裁定分钟覆盖自动事件归因，重叠分钟按生效顺序（自增 id，即落库顺序）
+      最新的未撤销裁定为准；撤销后回退到此前仍有效的裁定或事件归因；
+    - 撤销通过将 status 置为 revoked 完成（留痕、支持重复撤销幂等），
+      行本身不删除、历史修订不可改写。
+    """
+
+    __tablename__ = "manual_adjudications"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    shift_id: Mapped[int] = mapped_column(
+        ForeignKey("shifts.id"), nullable=False, index=True
+    )
+    ruling_no: Mapped[str] = mapped_column(String(64), nullable=False)
+    start_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    end_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    reason: Mapped[str] = mapped_column(String(16), nullable=False)
+    note: Mapped[str] = mapped_column(String(500), nullable=False, default="")
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    # active（生效中） | revoked（已撤销）
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    revoked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    __table_args__ = (
+        UniqueConstraint("shift_id", "ruling_no", name="uq_adjudication_no"),
+        CheckConstraint("end_ts > start_ts", name="ck_adjudications_valid_range"),
+        CheckConstraint(
+            "reason IN ('maintenance','failure','pending')",
+            name="ck_adjudications_reason",
+        ),
+        CheckConstraint(
+            "status IN ('active','revoked')", name="ck_adjudications_status"
+        ),
     )

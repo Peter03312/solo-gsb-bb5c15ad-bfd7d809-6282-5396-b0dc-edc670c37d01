@@ -50,6 +50,19 @@ def init_db(retries: int = 30, delay: float = 1.0) -> None:
         raise RuntimeError(f"cannot initialize database: {last_err}")
     _create_exclusion_constraint()
     _migrate_change_feed()
+    _migrate_adjudications()
+
+
+def _migrate_adjudications() -> None:
+    """为现场人工裁定补齐既有库结构（幂等，可重复执行）。
+
+    manual_adjudications 由 create_all 直接建出；既有库只需把 shift_results.trigger
+    加宽以容纳 adjudication / adjudication_revoke 触发器。
+    """
+    with engine.begin() as conn:
+        conn.execute(
+            text("ALTER TABLE shift_results ALTER COLUMN trigger TYPE VARCHAR(32)")
+        )
 
 
 def _migrate_change_feed() -> None:
@@ -124,7 +137,7 @@ def _create_exclusion_constraint() -> None:
                             device_id WITH =,
                             tstzrange(start_ts, end_ts, '[)') WITH &&
                         );
-                    EXCEPTION WHEN duplicate_object THEN
+                    EXCEPTION WHEN duplicate_object OR duplicate_table THEN
                         NULL;
                     END
                     $$;

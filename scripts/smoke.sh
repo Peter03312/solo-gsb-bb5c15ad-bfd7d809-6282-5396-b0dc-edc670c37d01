@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 冒烟脚本：走完 设备→班次→事件→幂等/冲突→结算→迟到更正→修订查询 全流程。
+# 冒烟脚本：走完 设备→班次→事件→幂等/冲突→结算→迟到更正→现场裁定/撤销→修订/变更查询 全流程。
 # 用法：./scripts/smoke.sh [BASE_URL]   （默认 http://localhost:8000）
 set -euo pipefail
 
@@ -47,16 +47,43 @@ req GET "/shifts/1/result"
 req GET "/shifts/1/result?revision=1"
 req GET "/shifts/1/revisions"
 
+echo "-- 现场人工裁定：10:30-11:30 改判故障（11:00-11:30 本就是故障），预期 revision=3、maintenance -30 / failure +30 --"
+req POST /shifts/1/adjudications '{"ruling_no":"R-001","start":"2026-10-01T10:30:00+08:00","end":"2026-10-01T11:30:00+08:00","reason":"failure","note":"现场核对为传动故障"}'
+
+echo "-- 同单号同内容重试：幂等 200，revision=null（无修订明确标示）--"
+req POST /shifts/1/adjudications '{"ruling_no":"R-001","start":"2026-10-01T10:30:00+08:00","end":"2026-10-01T11:30:00+08:00","reason":"failure","note":"现场核对为传动故障"}'
+
+echo "-- 同单号异内容：预期 409 RULING_CONFLICT --"
+req POST /shifts/1/adjudications '{"ruling_no":"R-001","start":"2026-10-01T10:30:00+08:00","end":"2026-10-01T11:30:00+08:00","reason":"pending","note":"改判待判"}'
+
+echo "-- 更晚生效的重叠裁定 R-002：11:00-12:00 待判，重叠分钟以它为准 --"
+req POST /shifts/1/adjudications '{"ruling_no":"R-002","start":"2026-10-01T11:00:00+08:00","end":"2026-10-01T12:00:00+08:00","reason":"pending","note":"二次裁定"}'
+
+echo "-- 裁定列表（含已撤销，按生效顺序）--"
+req GET /shifts/1/adjudications
+
+echo "-- 按单号撤销 R-002：重叠分钟回退至 R-001，产生 adjudication_revoke 修订 --"
+req POST /shifts/1/adjudications/R-002/revoke
+
+echo "-- 重复撤销：幂等 200，revision=null --"
+req POST /shifts/1/adjudications/R-002/revoke
+
+echo "-- 越界区间 / 未结算校验：越界 422 RULING_OUT_OF_RANGE，未知单号撤销 404 --"
+req POST /shifts/1/adjudications '{"ruling_no":"RX","start":"2026-10-01T07:00:00+08:00","end":"2026-10-01T09:00:00+08:00","reason":"failure","note":"越界"}'
+req POST /shifts/1/adjudications/NOPE/revoke
+
 echo "-- 变更同步：从游标 0 回放（每页 1 条），再用 next_cursor 翻页 --"
 req GET "/changes?cursor=0&limit=1"
 req GET "/changes?cursor=1&limit=10"
 
-echo "-- 已追平：空页保持原游标 --"
-req GET "/changes?cursor=2"
+echo "-- 已追平：空页保持原游标（游标取当前 next_cursor）--"
+LATEST_CURSOR="$(curl -sS "$BASE/changes?cursor=0&limit=500" | python3 -c 'import sys,json;print(json.load(sys.stdin)["next_cursor"])')"
+echo "当前最大游标：$LATEST_CURSOR"
+req GET "/changes?cursor=$LATEST_CURSOR"
 
 echo "-- 非法游标 / 超限页大小，预期 422 --"
 req GET "/changes?cursor=-1"
-req GET "/changes?cursor=999"
+req GET "/changes?cursor=999999"
 req GET "/changes?limit=1000"
 
 echo "-- 非法区间 / 未知设备，预期 422 / 404 --"

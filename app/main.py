@@ -14,6 +14,9 @@ from . import services
 from .db import get_db, init_db
 from .models import Shift, ShiftResult
 from .schemas import (
+    AdjudicationAck,
+    AdjudicationIn,
+    AdjudicationOut,
     ChangeEntry,
     ChangePage,
     DeviceCreate,
@@ -24,6 +27,7 @@ from .schemas import (
     ReasonMinutes,
     RecomputedShift,
     ResultOut,
+    RevisionRef,
     SettleResponse,
     ShiftCreate,
     ShiftOut,
@@ -38,12 +42,14 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="设备停机归因服务",
-    version="1.1.0",
+    version="1.2.0",
     description=(
         "按班次对设备停机时间进行归因（保养/故障/待判）。"
         "区间均为半开 [start, end)；重叠时保养 > 故障 > 待判，每分钟只归因一次；"
         "事件按 (来源, 连续版本) 上报，支持幂等与迟到更正重算；"
-        "GET /changes 提供按全局递增游标分页的结算/更正变更流，供下游报表同步。"
+        "已结算班次支持现场人工裁定（提交/按单号撤销），裁定覆盖自动事件归因，"
+        "撤销后回退；仅当各原因分钟数变化时追加班次修订并进入全局游标变更流；"
+        "GET /changes 提供按全局递增游标分页的结算/更正/裁定变更流，供下游报表同步。"
     ),
     lifespan=lifespan,
 )
@@ -217,6 +223,113 @@ def list_revisions(shift_id: int, db: Session = Depends(get_db)):
     shift, revs = services.list_revisions(db, shift_id)
     latest_revision = revs[-1].revision if revs else 0
     return [_result_out(shift, rev, latest_revision) for rev in revs]
+
+
+# ---------------------------------------------------------------- 现场人工裁定
+
+
+def _adjudication_ack(
+    ruling, idempotent: bool, rev: ShiftResult | None, latest_revision: int
+) -> AdjudicationAck:
+    detail = None
+    if rev is not None:
+        detail = RevisionRef(
+            revision=rev.revision,
+            seq=rev.seq,
+            totals=ReasonMinutes(
+                maintenance=rev.maintenance_minutes,
+                failure=rev.failure_minutes,
+                pending=rev.pending_minutes,
+            ),
+            delta=ReasonMinutes(
+                maintenance=rev.d_maintenance,
+                failure=rev.d_failure,
+                pending=rev.d_pending,
+            ),
+            trigger=rev.trigger,
+        )
+    return AdjudicationAck(
+        ruling_no=ruling.ruling_no,
+        status=ruling.status,
+        idempotent=idempotent,
+        revision=rev.revision if rev is not None else None,
+        latest_revision=latest_revision,
+        revision_detail=detail,
+    )
+
+
+@app.post(
+    "/shifts/{shift_id}/adjudications",
+    response_model=AdjudicationAck,
+    tags=["adjudications"],
+)
+def submit_adjudication(
+    shift_id: int,
+    payload: AdjudicationIn,
+    response: Response,
+    db: Session = Depends(get_db),
+):
+    """为已结算班次提交现场人工裁定。
+
+    - 裁定分钟覆盖自动事件归因；重叠分钟按生效顺序最新的未撤销裁定为准，
+      撤销后回退至此前有效裁定，无裁定时按当前最新事件版本计算；
+    - 同单号同内容重试幂等（200，不产生修订）；同单号异内容 409 RULING_CONFLICT；
+    - 仅当各原因分钟数变化时产生班次修订（revision 非空）并进入 /changes；
+    - 未知班次 404、班次未结算 409 SHIFT_NOT_SETTLED、区间越界 422 RULING_OUT_OF_RANGE、
+      非法原因/时间格式 422 VALIDATION_ERROR。
+    """
+    _shift, ruling, idempotent, rev, latest = services.submit_adjudication(
+        db, shift_id, payload
+    )
+    response.status_code = 200 if idempotent else 201
+    return _adjudication_ack(ruling, idempotent, rev, latest)
+
+
+@app.post(
+    "/shifts/{shift_id}/adjudications/{ruling_no}/revoke",
+    response_model=AdjudicationAck,
+    tags=["adjudications"],
+)
+def revoke_adjudication(
+    shift_id: int,
+    ruling_no: str,
+    response: Response,
+    db: Session = Depends(get_db),
+):
+    """按单号撤销现场人工裁定。
+
+    - 首次撤销 201，分钟数变化时产生修订（trigger=adjudication_revoke）；
+    - 重复撤销幂等（200，不产生修订）；
+    - 未知班次 404 SHIFT_NOT_FOUND，未知单号 404 RULING_NOT_FOUND。
+    """
+    _shift, ruling, idempotent, rev, latest = services.revoke_adjudication(
+        db, shift_id, ruling_no
+    )
+    response.status_code = 200 if idempotent else 201
+    return _adjudication_ack(ruling, idempotent, rev, latest)
+
+
+@app.get(
+    "/shifts/{shift_id}/adjudications",
+    response_model=list[AdjudicationOut],
+    tags=["adjudications"],
+)
+def list_adjudications(shift_id: int, db: Session = Depends(get_db)):
+    """列出班次的全部现场人工裁定（含已撤销），按生效顺序排列。"""
+    _shift, rows = services.list_adjudications(db, shift_id)
+    return [
+        AdjudicationOut(
+            ruling_no=r.ruling_no,
+            start=r.start_ts,
+            end=r.end_ts,
+            reason=r.reason,
+            note=r.note,
+            status=r.status,
+            created_at=r.created_at,
+            revoked_at=r.revoked_at,
+        )
+        for r in rows
+    ]
 
 
 # ---------------------------------------------------------------- 变更同步
