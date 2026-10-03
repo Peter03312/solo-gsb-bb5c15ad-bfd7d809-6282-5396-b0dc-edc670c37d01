@@ -14,6 +14,7 @@ from app.main import app
 
 TABLES = (
     "shift_results",
+    "manual_rulings",
     "event_versions",
     "event_sources",
     "shifts",

@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 
 from . import services
 from .db import get_db, init_db
-from .models import Shift, ShiftResult
+from .models import ManualRuling, Shift, ShiftResult
 from .schemas import (
     ChangeEntry,
     ChangePage,
@@ -24,6 +24,11 @@ from .schemas import (
     ReasonMinutes,
     RecomputedShift,
     ResultOut,
+    RevisionBrief,
+    RulingAck,
+    RulingIn,
+    RulingOut,
+    RulingRef,
     SettleResponse,
     ShiftCreate,
     ShiftOut,
@@ -38,12 +43,14 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="设备停机归因服务",
-    version="1.1.0",
+    version="1.2.0",
     description=(
         "按班次对设备停机时间进行归因（保养/故障/待判）。"
         "区间均为半开 [start, end)；重叠时保养 > 故障 > 待判，每分钟只归因一次；"
         "事件按 (来源, 连续版本) 上报，支持幂等与迟到更正重算；"
-        "GET /changes 提供按全局递增游标分页的结算/更正变更流，供下游报表同步。"
+        "已结算班次可提交/撤销现场人工裁定，每分钟以生效顺序最新的未撤销裁定"
+        "覆盖自动事件归因；GET /changes 提供按全局递增游标分页的"
+        "结算/更正/裁定变更流，供下游报表同步。"
     ),
     lifespan=lifespan,
 )
@@ -89,6 +96,7 @@ def _result_out(shift: Shift, rev: ShiftResult, latest_revision: int) -> ResultO
             pending=rev.d_pending,
         ),
         event_versions=[EventVersionRef(**ev) for ev in rev.event_versions],
+        rulings=[RulingRef(**rr) for rr in (rev.rulings or [])],
         trigger=rev.trigger,
         created_at=rev.created_at,
     )
@@ -152,6 +160,104 @@ def settle_shift(shift_id: int, db: Session = Depends(get_db)):
     return SettleResponse(
         settled=created, result=_result_out(shift, rev, rev.revision)
     )
+
+
+# ---------------------------------------------------------------- 现场人工裁定
+
+
+def _ruling_out(ruling: ManualRuling) -> RulingOut:
+    return RulingOut(
+        ruling_no=ruling.ruling_no,
+        seq=ruling.seq,
+        start=ruling.start_ts,
+        end=ruling.end_ts,
+        reason=ruling.reason,
+        note=ruling.note,
+        status="revoked" if ruling.revoked else "active",
+        created_at=ruling.created_at,
+        revoked_at=ruling.revoked_at,
+    )
+
+
+def _ruling_ack(
+    ruling: ManualRuling, rev: ShiftResult | None, idempotent: bool
+) -> RulingAck:
+    brief = (
+        RevisionBrief(
+            revision=rev.revision,
+            totals=ReasonMinutes(
+                maintenance=rev.maintenance_minutes,
+                failure=rev.failure_minutes,
+                pending=rev.pending_minutes,
+            ),
+            delta=ReasonMinutes(
+                maintenance=rev.d_maintenance,
+                failure=rev.d_failure,
+                pending=rev.d_pending,
+            ),
+        )
+        if rev is not None
+        else None
+    )
+    return RulingAck(
+        ruling_no=ruling.ruling_no,
+        status="revoked" if ruling.revoked else "active",
+        idempotent=idempotent,
+        revision_created=rev is not None,
+        revision=rev.revision if rev is not None else None,
+        result=brief,
+    )
+
+
+@app.post(
+    "/shifts/{shift_id}/rulings",
+    response_model=RulingAck,
+    tags=["rulings"],
+)
+def submit_ruling(
+    shift_id: int,
+    payload: RulingIn,
+    response: Response,
+    db: Session = Depends(get_db),
+):
+    """为已结算班次提交现场人工裁定。
+
+    - 单号在班次内唯一；相同单号及内容重试幂等（200，idempotent=true），
+      相同单号异内容 409 RULING_CONFLICT，已撤销单号 409 RULING_REVOKED；
+    - 区间必须为落在班次窗口内的整分钟半开区间，越界 422 RULING_OUT_OF_RANGE；
+      非法原因/区间格式 422 VALIDATION_ERROR；未结算 409 SHIFT_NOT_SETTLED；
+    - 每分钟以生效顺序最新的未撤销裁定覆盖自动事件归因；仅当各原因分钟数
+      变化时追加班次修订（trigger=ruling_submit）并进入 /changes 变更流。
+    """
+    ruling, rev, idempotent = services.submit_ruling(db, shift_id, payload)
+    response.status_code = 200 if idempotent else 201
+    return _ruling_ack(ruling, rev, idempotent)
+
+
+@app.post(
+    "/shifts/{shift_id}/rulings/{ruling_no}/revoke",
+    response_model=RulingAck,
+    tags=["rulings"],
+)
+def revoke_ruling(shift_id: int, ruling_no: str, db: Session = Depends(get_db)):
+    """按单号撤销现场人工裁定；重复撤销幂等，未知班次/单号分别 404。
+
+    撤销后重叠分钟回退至此前仍有效的裁定（无则回到最新事件版本归因）；
+    仅当各原因分钟数变化时追加修订（trigger=ruling_revoke）并进入变更流。
+    """
+    ruling, rev, idempotent = services.revoke_ruling(db, shift_id, ruling_no)
+    return _ruling_ack(ruling, rev, idempotent)
+
+
+@app.get(
+    "/shifts/{shift_id}/rulings",
+    response_model=list[RulingOut],
+    tags=["rulings"],
+)
+def list_rulings(shift_id: int, db: Session = Depends(get_db)):
+    """列出现场裁定（含已撤销），按生效顺序 seq 升序；未知班次 404。"""
+    _, rows = services.list_rulings(db, shift_id)
+    return [_ruling_out(r) for r in rows]
 
 
 # ---------------------------------------------------------------- 事件
@@ -241,6 +347,7 @@ def _change_entry(shift: Shift, rev: ShiftResult) -> ChangeEntry:
             pending=rev.d_pending,
         ),
         event_versions=[EventVersionRef(**ev) for ev in rev.event_versions],
+        rulings=[RulingRef(**rr) for rr in (rev.rulings or [])],
         trigger=rev.trigger,
         created_at=rev.created_at,
     )

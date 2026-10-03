@@ -80,6 +80,60 @@ class EventVersionRef(BaseModel):
     reason: str
 
 
+class RulingIn(_Interval):
+    """现场人工裁定提交：班次内唯一单号 + 半开整分钟区间 + 原因 + 说明。"""
+
+    ruling_no: str = Field(
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9._:-]+$",
+        examples=["J-20261001-001"],
+        description="班次内唯一的裁定单号（业务幂等键，撤销后不可复用）",
+    )
+    reason: Reason
+    note: str = Field(default="", max_length=500)
+
+
+class RulingRef(BaseModel):
+    """修订快照中实际贡献了分钟的现场裁定引用。"""
+
+    ruling_no: str
+    reason: str
+
+
+class RulingOut(BaseModel):
+    """单条现场人工裁定的当前状态。"""
+
+    ruling_no: str
+    seq: int
+    start: datetime
+    end: datetime
+    reason: str
+    note: str
+    status: str  # active | revoked
+    created_at: datetime
+    revoked_at: datetime | None = None
+
+
+class RevisionBrief(BaseModel):
+    """裁定提交/撤销产生新班次修订时的修订摘要；无修订时为 null。"""
+
+    revision: int
+    totals: ReasonMinutes
+    delta: ReasonMinutes
+
+
+class RulingAck(BaseModel):
+    """裁定提交/撤销的响应：单号、状态与本次修订号（无修订时明确标示）。"""
+
+    ruling_no: str
+    status: str  # active | revoked
+    idempotent: bool  # True 表示重复提交/重复撤销命中幂等，未产生新数据
+    revision_created: bool
+    revision: int | None = None
+    result: RevisionBrief | None = None
+
+
 class RecomputedShift(BaseModel):
     """迟到更正触发重算后，某个受影响班次的新修订摘要。"""
 
@@ -107,7 +161,8 @@ class ResultOut(BaseModel):
     totals: ReasonMinutes
     delta: ReasonMinutes  # 本修订相对上一修订的差额
     event_versions: list[EventVersionRef]
-    trigger: str  # settle | correction
+    rulings: list[RulingRef] = []  # 本修订实际依据的现场裁定；历史修订为 []
+    trigger: str  # settle | correction | ruling_submit | ruling_revoke
     created_at: datetime
 
 
@@ -128,7 +183,8 @@ class ChangeEntry(BaseModel):
     totals: ReasonMinutes
     delta: ReasonMinutes  # 本修订相对上一修订的差额
     event_versions: list[EventVersionRef]
-    trigger: str  # settle | correction
+    rulings: list[RulingRef] = []  # 本修订实际依据的现场裁定；历史修订为 []
+    trigger: str  # settle | correction | ruling_submit | ruling_revoke
     created_at: datetime
 
 

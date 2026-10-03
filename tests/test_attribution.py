@@ -11,6 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.attribution import (  # noqa: E402
     EventView,
+    RulingView,
     attribute,
     merge,
     subtract,
@@ -27,6 +28,10 @@ def h(hours: float = 0, minutes: float = 0) -> datetime:
 
 def ev(source: str, version: int, reason: str, start: datetime, end: datetime) -> EventView:
     return EventView(source_id=source, version=version, reason=reason, start=start, end=end)
+
+
+def rv(no: str, seq: int, reason: str, start: datetime, end: datetime) -> RulingView:
+    return RulingView(ruling_no=no, seq=seq, reason=reason, start=start, end=end)
 
 
 # ---------------------------------------------------------------- 区间原语
@@ -64,17 +69,17 @@ def test_total_minutes():
 
 
 def test_no_events():
-    totals, used = attribute(h(8), h(16), [])
+    totals, used, _used_r = attribute(h(8), h(16), [])
     assert totals == {"maintenance": 0, "failure": 0, "pending": 0}
     assert used == []
 
 
 def test_half_open_interval():
     # [08:00, 10:00) 恰好 120 分钟，10:00 这一分钟不计入
-    totals, _ = attribute(h(8), h(16), [ev("S1", 1, "failure", h(8), h(10))])
+    totals, _, _r = attribute(h(8), h(16), [ev("S1", 1, "failure", h(8), h(10))])
     assert totals["failure"] == 120
     # 相接事件不重叠、不漏分钟
-    totals, _ = attribute(
+    totals, _, _r = attribute(
         h(8),
         h(16),
         [ev("S1", 1, "failure", h(8), h(10)), ev("S2", 1, "failure", h(10), h(11))],
@@ -83,16 +88,16 @@ def test_half_open_interval():
 
 
 def test_event_clipped_to_shift_window():
-    totals, _ = attribute(h(8), h(16), [ev("S1", 1, "failure", h(7), h(9))])
+    totals, _, _r = attribute(h(8), h(16), [ev("S1", 1, "failure", h(7), h(9))])
     assert totals["failure"] == 60
     # 完全在班次外的事件不参与归因，也不出现在依据版本中
-    totals, used = attribute(h(8), h(16), [ev("S1", 1, "failure", h(2), h(3))])
+    totals, used, _used_r = attribute(h(8), h(16), [ev("S1", 1, "failure", h(2), h(3))])
     assert totals["failure"] == 0
     assert used == []
 
 
 def test_priority_maintenance_over_failure():
-    totals, used = attribute(
+    totals, used, _used_r = attribute(
         h(8),
         h(16),
         [
@@ -105,7 +110,7 @@ def test_priority_maintenance_over_failure():
 
 
 def test_priority_failure_over_pending():
-    totals, used = attribute(
+    totals, used, _used_r = attribute(
         h(8),
         h(16),
         [
@@ -118,7 +123,7 @@ def test_priority_failure_over_pending():
 
 def test_pending_subtracts_maintenance_and_failure():
     # 待判 [10:00, 12:00)，保养 [10:00,10:30)，故障 [11:00,11:30)
-    totals, _ = attribute(
+    totals, _, _r = attribute(
         h(8),
         h(16),
         [
@@ -132,7 +137,7 @@ def test_pending_subtracts_maintenance_and_failure():
 
 def test_each_minute_attributed_once():
     # 三者完全重叠：全部归保养
-    totals, used = attribute(
+    totals, used, _used_r = attribute(
         h(8),
         h(16),
         [
@@ -148,7 +153,7 @@ def test_each_minute_attributed_once():
 
 def test_same_reason_events_union():
     # 同原因重叠事件合并计算，不重复计分钟
-    totals, _ = attribute(
+    totals, _, _r = attribute(
         h(8),
         h(16),
         [
@@ -160,7 +165,7 @@ def test_same_reason_events_union():
 
 
 def test_used_versions_reflect_contribution():
-    totals, used = attribute(
+    totals, used, _used_r = attribute(
         h(8),
         h(16),
         [
@@ -172,6 +177,150 @@ def test_used_versions_reflect_contribution():
     assert totals == {"maintenance": 60, "failure": 60, "pending": 0}
     by_source = {u["source_id"]: u["version"] for u in used}
     assert by_source == {"M1": 3, "F2": 1}
+
+
+# ---------------------------------------------------------------- 现场人工裁定
+
+
+def test_ruling_overrides_event_on_same_minutes():
+    # 自动归因：10:00-12:00 故障 120；裁定 10:00-11:00 为保养
+    totals, used, used_rulings = attribute(
+        h(8),
+        h(16),
+        [ev("F1", 1, "failure", h(10), h(12))],
+        [rv("J1", 1, "maintenance", h(10), h(11))],
+    )
+    assert totals == {"maintenance": 60, "failure": 60, "pending": 0}
+    assert used_rulings == [{"ruling_no": "J1", "reason": "maintenance"}]
+    # 故障事件仍在 11:00-12:00 贡献，保留在依据版本中
+    assert [u["source_id"] for u in used] == ["F1"]
+
+
+def test_ruling_without_events_sets_reason_minutes():
+    # 无自动事件，裁定直接产生待判分钟
+    totals, used, used_rulings = attribute(
+        h(8), h(16), [], [rv("J1", 1, "pending", h(9), h(10, 30))]
+    )
+    assert totals == {"maintenance": 0, "failure": 0, "pending": 90}
+    assert used == []
+    assert used_rulings == [{"ruling_no": "J1", "reason": "pending"}]
+
+
+def test_overlapping_rulings_latest_seq_wins():
+    # J1(seq=1) 保养 10:00-12:00；J2(seq=2) 故障 11:00-12:00 覆盖重叠分钟
+    totals, _used, used_rulings = attribute(
+        h(8),
+        h(16),
+        [],
+        [
+            rv("J1", 1, "maintenance", h(10), h(12)),
+            rv("J2", 2, "failure", h(11), h(12)),
+        ],
+    )
+    assert totals == {"maintenance": 60, "failure": 60, "pending": 0}
+    assert used_rulings == [
+        {"ruling_no": "J1", "reason": "maintenance"},
+        {"ruling_no": "J2", "reason": "failure"},
+    ]
+
+
+def test_latest_ruling_revoked_falls_back_to_earlier_ruling():
+    # 撤销 J2（不出现在输入中）后，11:00-12:00 回退给 J1 的保养
+    totals, _used, used_rulings = attribute(
+        h(8), h(16), [], [rv("J1", 1, "maintenance", h(10), h(12))]
+    )
+    assert totals == {"maintenance": 120, "failure": 0, "pending": 0}
+    assert used_rulings == [{"ruling_no": "J1", "reason": "maintenance"}]
+
+
+def test_revoke_all_rulings_falls_back_to_events():
+    # 自动故障 10:00-12:00；曾被保养裁定全覆盖，裁定全部撤销后回到自动归因
+    totals, used, used_rulings = attribute(
+        h(8), h(16), [ev("F1", 1, "failure", h(10), h(12))], []
+    )
+    assert totals == {"maintenance": 0, "failure": 120, "pending": 0}
+    assert [u["source_id"] for u in used] == ["F1"]
+    assert used_rulings == []
+
+
+def test_three_rulings_chain_only_latest_per_minute():
+    # 同一区间三层裁定：J1 保养、J2 故障、J3 待判 —— 全部归待判，J1/J2 无贡献
+    totals, _used, used_rulings = attribute(
+        h(8),
+        h(16),
+        [ev("F1", 1, "failure", h(10), h(11))],
+        [
+            rv("J1", 1, "maintenance", h(10), h(11)),
+            rv("J2", 2, "failure", h(10), h(11)),
+            rv("J3", 3, "pending", h(10), h(11)),
+        ],
+    )
+    assert totals == {"maintenance": 0, "failure": 0, "pending": 60}
+    assert used_rulings == [{"ruling_no": "J3", "reason": "pending"}]
+    # 撤销 J3 → 回退 J2（故障）
+    totals, _, used_rulings = attribute(
+        h(8),
+        h(16),
+        [ev("F1", 1, "failure", h(10), h(11))],
+        [
+            rv("J1", 1, "maintenance", h(10), h(11)),
+            rv("J2", 2, "failure", h(10), h(11)),
+        ],
+    )
+    assert totals == {"maintenance": 0, "failure": 60, "pending": 0}
+    assert used_rulings == [{"ruling_no": "J2", "reason": "failure"}]
+    # 再撤销 J2 → 回退 J1（保养）
+    totals, _, used_rulings = attribute(
+        h(8),
+        h(16),
+        [ev("F1", 1, "failure", h(10), h(11))],
+        [rv("J1", 1, "maintenance", h(10), h(11))],
+    )
+    assert totals == {"maintenance": 60, "failure": 0, "pending": 0}
+
+
+def test_ruling_clipped_to_shift_and_partial_contribution():
+    # 裁定区间超出班次窗口时裁剪；J2 与 J1 部分重叠，二者各计贡献区间
+    totals, _used, used_rulings = attribute(
+        h(8),
+        h(16),
+        [],
+        [
+            rv("J1", 1, "failure", h(7), h(9)),        # 裁剪为 08:00-09:00
+            rv("J2", 2, "maintenance", h(8, 30), h(17)),  # 裁剪为 08:30-16:00
+        ],
+    )
+    assert totals == {"maintenance": 450, "failure": 30, "pending": 0}
+    assert [r["ruling_no"] for r in used_rulings] == ["J1", "J2"]
+
+
+def test_ruling_then_correction_interaction():
+    # 裁定 10:00-11:00 保养；事件更正把故障从 10:00-12:00 改为 11:00-12:00：
+    # 裁定分钟不受影响，自动分钟跟随最新事件版本
+    totals, used, used_rulings = attribute(
+        h(8),
+        h(16),
+        [ev("F1", 2, "failure", h(11), h(12))],
+        [rv("J1", 1, "maintenance", h(10), h(11))],
+    )
+    assert totals == {"maintenance": 60, "failure": 60, "pending": 0}
+    assert [u["source_id"] for u in used] == ["F1"]
+    assert used_rulings == [{"ruling_no": "J1", "reason": "maintenance"}]
+
+
+def test_same_seq_rulings_same_reason_union():
+    # 同 seq（不会由正常流程产生，仅验证算法健壮性）：互不扣除，同原因取并集
+    totals, _, used_rulings = attribute(
+        h(8),
+        h(16),
+        [],
+        [
+            rv("J1", 1, "failure", h(10), h(11)),
+            rv("J2", 1, "failure", h(10, 30), h(12)),
+        ],
+    )
+    assert totals == {"maintenance": 0, "failure": 120, "pending": 0}
+    assert [r["ruling_no"] for r in used_rulings] == ["J1", "J2"]
 
 
 if __name__ == "__main__":

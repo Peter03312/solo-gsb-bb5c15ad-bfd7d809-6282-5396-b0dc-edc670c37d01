@@ -50,6 +50,23 @@ def init_db(retries: int = 30, delay: float = 1.0) -> None:
         raise RuntimeError(f"cannot initialize database: {last_err}")
     _create_exclusion_constraint()
     _migrate_change_feed()
+    _migrate_rulings()
+
+
+def _migrate_rulings() -> None:
+    """为既有 shift_results 补齐现场裁定快照列（幂等，可重复执行）。
+
+    manual_rulings 表由 create_all 直接建出；历史修订早于本功能，
+    其裁定依据统一回填为空列表（空数组，语义为“无人工裁定贡献”），
+    不触碰任何已返回变更的内容与序号。
+    """
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "ALTER TABLE shift_results ADD COLUMN IF NOT EXISTS rulings JSONB "
+                "NOT NULL DEFAULT '[]'"
+            )
+        )
 
 
 def _migrate_change_feed() -> None:
@@ -124,8 +141,12 @@ def _create_exclusion_constraint() -> None:
                             device_id WITH =,
                             tstzrange(start_ts, end_ts, '[)') WITH &&
                         );
-                    EXCEPTION WHEN duplicate_object THEN
-                        NULL;
+                    EXCEPTION
+                        -- duplicate_object（约束名冲突）
+                        WHEN duplicate_object THEN NULL;
+                        -- 排他约束同名重入在部分 PG 版本以 42P07（relation 已存在）抛出
+                        WHEN OTHERS THEN
+                            IF SQLSTATE = '42P07' THEN NULL; ELSE RAISE; END IF;
                     END
                     $$;
                     """

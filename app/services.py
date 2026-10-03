@@ -12,9 +12,17 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from . import attribution
-from .attribution import EventView
-from .models import ChangeCounter, Device, EventSource, EventVersion, Shift, ShiftResult
-from .schemas import DeviceCreate, EventIn, ShiftCreate
+from .attribution import EventView, RulingView
+from .models import (
+    ChangeCounter,
+    Device,
+    EventSource,
+    EventVersion,
+    ManualRuling,
+    Shift,
+    ShiftResult,
+)
+from .schemas import DeviceCreate, EventIn, RulingIn, ShiftCreate
 
 
 class ApiError(HTTPException):
@@ -32,6 +40,13 @@ def _utc(dt: datetime) -> datetime:
 
 def _content_hash(start: datetime, end: datetime, reason: str) -> str:
     raw = f"{start.isoformat()}|{end.isoformat()}|{reason}"
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def _ruling_hash(
+    start: datetime, end: datetime, reason: str, note: str
+) -> str:
+    raw = f"{start.isoformat()}|{end.isoformat()}|{reason}|{note}"
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
@@ -162,6 +177,37 @@ def _current_event_views(
     ]
 
 
+def _active_ruling_views(db: Session, shift_id: int) -> list[RulingView]:
+    """班次当前未撤销的全部现场裁定（区间在落库时已裁剪约束在班次内）。
+
+    按生效顺序 seq 升序返回；归因算法对重叠分钟只保留 seq 最大者，
+    撤销（revoked=True）的裁定不参与，重叠分钟即回退到此前有效裁定。
+    """
+    rows = (
+        db.execute(
+            select(ManualRuling)
+            .where(
+                ManualRuling.shift_id == shift_id,
+                ManualRuling.revoked.is_(False),
+            )
+            .order_by(ManualRuling.seq)
+        )
+        .scalars()
+        .all()
+    )
+    return [
+        RulingView(
+            ruling_no=r.ruling_no,
+            seq=r.seq,
+            reason=r.reason,
+            start=r.start_ts,
+            end=r.end_ts,
+            note=r.note,
+        )
+        for r in rows
+    ]
+
+
 def _latest_revision(db: Session, shift_id: int) -> ShiftResult | None:
     return (
         db.execute(
@@ -175,9 +221,25 @@ def _latest_revision(db: Session, shift_id: int) -> ShiftResult | None:
     )
 
 
-def _compute(db: Session, shift: Shift) -> tuple[dict, list[dict]]:
+def _compute(db: Session, shift: Shift) -> tuple[dict, list[dict], list[dict]]:
+    """按“当前最新事件版本 + 当前未撤销裁定”重算班次归因。
+
+    返回 (totals, 实际贡献的事件版本, 实际贡献的裁定)。
+    裁定覆盖分钟优先于自动事件；无裁定时与历史行为完全一致。
+    """
     events = _current_event_views(db, shift.device_id, shift.start_ts, shift.end_ts)
-    return attribution.attribute(shift.start_ts, shift.end_ts, events)
+    rulings = _active_ruling_views(db, shift.id)
+    return attribution.attribute(
+        shift.start_ts, shift.end_ts, events, rulings
+    )
+
+
+def _same_totals(totals: dict, rev: ShiftResult) -> bool:
+    return (
+        totals["maintenance"] == rev.maintenance_minutes
+        and totals["failure"] == rev.failure_minutes
+        and totals["pending"] == rev.pending_minutes
+    )
 
 
 def _new_revision(
@@ -187,6 +249,7 @@ def _new_revision(
     used: list[dict],
     trigger: str,
     base: ShiftResult | None,
+    used_rulings: list[dict] | None = None,
 ) -> ShiftResult:
     if base is None:
         revision, bm, bf, bp = 1, 0, 0, 0
@@ -208,6 +271,7 @@ def _new_revision(
         d_failure=totals["failure"] - bf,
         d_pending=totals["pending"] - bp,
         event_versions=used,
+        rulings=used_rulings or [],
         trigger=trigger,
     )
     db.add(rev)
@@ -227,8 +291,16 @@ def settle_shift(db: Session, shift_id: int) -> tuple[Shift, ShiftResult, bool]:
     latest = _latest_revision(db, shift_id)
     if latest is not None:
         return shift, latest, False
-    totals, used = _compute(db, shift)
-    rev = _new_revision(db, shift, totals, used, trigger="settle", base=None)
+    totals, used, used_rulings = _compute(db, shift)
+    rev = _new_revision(
+        db,
+        shift,
+        totals,
+        used,
+        trigger="settle",
+        base=None,
+        used_rulings=used_rulings,
+    )
     db.commit()
     db.refresh(rev)
     return shift, rev, True
@@ -347,17 +419,204 @@ def _recompute_affected_shifts(
         latest = _latest_revision(db, shift.id)
         if latest is None:
             continue  # 尚未结算：结算时自然会使用最新事件版本
-        totals, used = _compute(db, shift)
-        if (
-            totals["maintenance"] == latest.maintenance_minutes
-            and totals["failure"] == latest.failure_minutes
-            and totals["pending"] == latest.pending_minutes
-        ):
-            continue  # 结果未变化，不产生空修订
-        rev = _new_revision(db, shift, totals, used, trigger="correction", base=latest)
+        # 同期事件更正与现场裁定叠加重算：裁定覆盖分钟不受事件版本变化影响
+        totals, used, used_rulings = _compute(db, shift)
+        if _same_totals(totals, latest):
+            continue  # 各原因分钟数未变化，不产生空修订
+        rev = _new_revision(
+            db,
+            shift,
+            totals,
+            used,
+            trigger="correction",
+            base=latest,
+            used_rulings=used_rulings,
+        )
         db.flush()
         recomputed.append((shift, rev))
     return recomputed
+
+
+# ---------------------------------------------------------------- 现场人工裁定
+
+
+def _get_ruling(
+    db: Session, shift_id: int, ruling_no: str, for_update: bool = False
+) -> ManualRuling | None:
+    stmt = select(ManualRuling).where(
+        ManualRuling.shift_id == shift_id,
+        ManualRuling.ruling_no == ruling_no,
+    )
+    if for_update:
+        stmt = stmt.with_for_update()
+    return db.execute(stmt).scalar_one_or_none()
+
+
+def _next_ruling_seq(db: Session, shift_id: int) -> int:
+    """班次内的裁定生效顺序：max(seq)+1。调用方须已持有班次行锁，
+    故同班次的提交/撤销被串行化，seq 分配与并发事件更正都不会丢失更新。
+    """
+    return (
+        db.execute(
+            select(func.coalesce(func.max(ManualRuling.seq), 0)).where(
+                ManualRuling.shift_id == shift_id
+            )
+        ).scalar_one()
+    ) + 1
+
+
+def submit_ruling(
+    db: Session, shift_id: int, payload: RulingIn
+) -> tuple[ManualRuling, ShiftResult | None, bool]:
+    """提交现场人工裁定（仅限已结算班次）。
+
+    返回 (裁定, 新修订或 None, 是否幂等命中)。
+    - 相同单号 + 相同内容重试：幂等返回当前状态，不产生新数据/新修订；
+    - 相同单号 + 不同内容：409 RULING_CONFLICT；
+    - 单号已撤销：409 RULING_REVOKED（单号不复用）；
+    - 区间越出班次窗口：422 RULING_OUT_OF_RANGE。
+    各原因分钟数变化时才追加修订并进入全局变更流。
+    """
+    shift = db.execute(
+        select(Shift).where(Shift.id == shift_id).with_for_update()
+    ).scalar_one_or_none()
+    if shift is None:
+        raise ApiError(404, "SHIFT_NOT_FOUND", f"unknown shift id={shift_id}")
+    latest = _latest_revision(db, shift_id)
+    if latest is None:
+        raise ApiError(
+            409,
+            "SHIFT_NOT_SETTLED",
+            f"shift id={shift_id} has not been settled; settle it before ruling",
+        )
+
+    start, end = _utc(payload.start), _utc(payload.end)
+    digest = _ruling_hash(start, end, payload.reason, payload.note)
+
+    # 先识别同单号重试/冲突（即使新载荷越界或非法，也明确按单号语义报错）
+    existing = _get_ruling(db, shift_id, payload.ruling_no, for_update=True)
+    if existing is not None:
+        if existing.revoked:
+            raise ApiError(
+                409,
+                "RULING_REVOKED",
+                f"ruling_no {payload.ruling_no!r} was revoked and cannot be reused",
+            )
+        if existing.content_hash != digest:
+            raise ApiError(
+                409,
+                "RULING_CONFLICT",
+                f"ruling_no {payload.ruling_no!r} already exists with different content",
+            )
+        db.commit()  # 尽早释放班次行锁
+        return existing, None, True  # 相同单号及内容重试：幂等
+
+    if start < shift.start_ts or end > shift.end_ts:
+        raise ApiError(
+            422,
+            "RULING_OUT_OF_RANGE",
+            f"ruling [{start.isoformat()}, {end.isoformat()}) is not within "
+            f"shift [{shift.start_ts.isoformat()}, {shift.end_ts.isoformat()})",
+        )
+
+    ruling = ManualRuling(
+        shift_id=shift_id,
+        ruling_no=payload.ruling_no,
+        seq=_next_ruling_seq(db, shift_id),
+        start_ts=start,
+        end_ts=end,
+        reason=payload.reason,
+        note=payload.note,
+        content_hash=digest,
+        revoked=False,
+    )
+    db.add(ruling)
+    db.flush()
+
+    rev: ShiftResult | None = None
+    totals, used, used_rulings = _compute(db, shift)
+    if not _same_totals(totals, latest):
+        rev = _new_revision(
+            db,
+            shift,
+            totals,
+            used,
+            trigger="ruling_submit",
+            base=latest,
+            used_rulings=used_rulings,
+        )
+        db.flush()
+    db.commit()
+    db.refresh(ruling)
+    if rev is not None:
+        db.refresh(rev)
+    return ruling, rev, False
+
+
+def revoke_ruling(
+    db: Session, shift_id: int, ruling_no: str
+) -> tuple[ManualRuling, ShiftResult | None, bool]:
+    """按单号撤销现场人工裁定。
+
+    返回 (裁定, 新修订或 None, 是否幂等命中)。
+    - 重复撤销幂等：已撤销则原样返回，不产生新数据/新修订；
+    - 未知班次 404 SHIFT_NOT_FOUND；未知单号 404 RULING_NOT_FOUND；
+    - 撤销使重叠分钟回退到此前有效裁定/自动事件，各原因分钟数变化时才追加修订。
+    """
+    shift = db.execute(
+        select(Shift).where(Shift.id == shift_id).with_for_update()
+    ).scalar_one_or_none()
+    if shift is None:
+        raise ApiError(404, "SHIFT_NOT_FOUND", f"unknown shift id={shift_id}")
+
+    ruling = _get_ruling(db, shift_id, ruling_no, for_update=True)
+    if ruling is None:
+        raise ApiError(
+            404,
+            "RULING_NOT_FOUND",
+            f"unknown ruling_no {ruling_no!r} on shift id={shift_id}",
+        )
+    latest = _latest_revision(db, shift_id)  # 裁定存在即已结算；作为差额基准
+    if ruling.revoked:
+        db.commit()  # 尽早释放班次行锁
+        return ruling, None, True  # 重复撤销：幂等返回
+
+    ruling.revoked = True
+    ruling.revoked_at = datetime.now(timezone.utc)
+    db.flush()
+
+    rev: ShiftResult | None = None
+    totals, used, used_rulings = _compute(db, shift)
+    if not _same_totals(totals, latest):
+        rev = _new_revision(
+            db,
+            shift,
+            totals,
+            used,
+            trigger="ruling_revoke",
+            base=latest,
+            used_rulings=used_rulings,
+        )
+        db.flush()
+    db.commit()
+    db.refresh(ruling)
+    if rev is not None:
+        db.refresh(rev)
+    return ruling, rev, False
+
+
+def list_rulings(db: Session, shift_id: int) -> tuple[Shift, list[ManualRuling]]:
+    shift = get_shift_or_404(db, shift_id)
+    rows = (
+        db.execute(
+            select(ManualRuling)
+            .where(ManualRuling.shift_id == shift_id)
+            .order_by(ManualRuling.seq)
+        )
+        .scalars()
+        .all()
+    )
+    return shift, list(rows)
 
 
 # ---------------------------------------------------------------- 结果查询

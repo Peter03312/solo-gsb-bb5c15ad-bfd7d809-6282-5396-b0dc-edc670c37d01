@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from sqlalchemy import (
+    Boolean,
     CheckConstraint,
     DateTime,
     ForeignKey,
@@ -86,6 +87,47 @@ class EventVersion(Base):
     )
 
 
+class ManualRuling(Base):
+    """已结算班次的现场人工裁定。
+
+    - ruling_no 为班次内唯一的裁定单号（客户端提交时提供，业务幂等键，不复用）；
+    - seq 为班次内的生效顺序：同一分钟被多条裁定覆盖时，seq 最大（最新）者生效，
+      撤销后自然回退至此前仍有效的裁定；
+    - 区间为半开 [start_ts, end_ts) 且必须落在所属班次窗口内（应用校验 + CHECK 兜底）；
+    - 撤销为软删除（revoked=True）：单号永久保留以供幂等与审计，不允许重新提交。
+    """
+
+    __tablename__ = "manual_rulings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    shift_id: Mapped[int] = mapped_column(
+        ForeignKey("shifts.id"), nullable=False, index=True
+    )
+    ruling_no: Mapped[str] = mapped_column(String(64), nullable=False)
+    seq: Mapped[int] = mapped_column(Integer, nullable=False)
+    start_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    end_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    reason: Mapped[str] = mapped_column(String(16), nullable=False)
+    note: Mapped[str] = mapped_column(String(500), nullable=False, default="")
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    revoked: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    revoked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    __table_args__ = (
+        UniqueConstraint("shift_id", "ruling_no", name="uq_manual_ruling_no"),
+        CheckConstraint("end_ts > start_ts", name="ck_manual_ruling_range"),
+        CheckConstraint(
+            "reason IN ('maintenance','failure','pending')",
+            name="ck_manual_ruling_reason",
+        ),
+    )
+
+
 class ChangeCounter(Base):
     """变更序号计数器（单例行 id=1）。
 
@@ -126,7 +168,11 @@ class ShiftResult(Base):
     d_pending: Mapped[int] = mapped_column(Integer, nullable=False)
     # 本次计算所依据的事件版本：[{"source_id", "version", "reason"}, ...]
     event_versions: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
-    trigger: Mapped[str] = mapped_column(String(16), nullable=False)  # settle | correction
+    # 本次计算实际贡献了分钟的现场裁定：[{"ruling_no", "reason"}, ...]
+    # 修订只追加，故该快照随修订永久保留；既有修订为空列表（迁移补默认值）
+    rulings: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    # settle | correction | ruling_submit | ruling_revoke
+    trigger: Mapped[str] = mapped_column(String(16), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
